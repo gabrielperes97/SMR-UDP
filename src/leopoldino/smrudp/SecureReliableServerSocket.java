@@ -1,12 +1,12 @@
 package leopoldino.smrudp;
 
-import leopoldino.smrudp.impl.NioUdpTransport;
 import net.rudp.*;
 import net.rudp.impl.SYNSegment;
 import net.rudp.impl.Segment;
 import net.rudp.impl.UIDSegment;
 import org.bouncycastle.crypto.tls.DTLSServerProtocol;
 import org.bouncycastle.crypto.tls.DTLSTransport;
+import org.bouncycastle.crypto.tls.DatagramTransport;
 import org.bouncycastle.crypto.tls.TlsServer;
 
 import java.io.IOException;
@@ -18,9 +18,10 @@ import java.security.SecureRandom;
 import java.util.HashMap;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Semaphore;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.function.BiConsumer;
 import java.util.logging.Logger;
 
@@ -32,31 +33,24 @@ import java.util.logging.Logger;
  * @author Gabriel Leopoldino
  */
 
-//TODO This class works, but need be revised
-//TODO Test change of endpoint of a client
 public class SecureReliableServerSocket extends ReliableServerSocket {
-    /**
-     * LOGGER
-     */
+
     public static final Logger LOGGER = Logger.getLogger(SecureReliableServerSocket.class.getCanonicalName());
     static private ExecutorService _connectionPool;
-    static private ExecutorService _recvSegmentPool;
     /* A table of active opened client sockets. */
     private final HashMap<SocketAddress, ClientHolder> _clientSockTable;
-    private NioUdpTransport _transport;
     private DTLSServerProtocol _dtlsProtocol;
     private TlsServer _serverConfig;
     private ReceiverThread _receiverThread;
+    /* Consumer task for the received packets */
+    private ProcessSegmentThread _processSegmentThread;
+    private NioScheduler _scheduler;
     private int _sendBufferSize;
     private int _recvBufferSize;
-    private byte[] _recvBuffer;
 
-    /**
-     * Specific Functions
-     */
-    private int _recvBufferOffset;
-    private int _recvBufferLen;
-    private Semaphore _bufferLocker = new Semaphore(1);
+
+    /* Buffer for the received packets used for the Producer/Consumer mechanism */
+    private BlockingQueue<BufferedPacket> _recvRawPacketsBuffer;
 
     public SecureReliableServerSocket(TlsServer serverConfig) throws IOException {
         this(0, 0, null, new ReliableSocketProfile(), serverConfig, new SecureRandom());
@@ -83,19 +77,15 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         _timeout = 0;
         _closed = false;
 
-        _sendBufferSize = (_profile.maxSegmentSize() - Segment.RUDP_HEADER_LEN) * _profile.maxRecvQueueSize();
-        _recvBufferSize = (_profile.maxSegmentSize() - Segment.RUDP_HEADER_LEN) * _profile.maxSendQueueSize();
-        _serverConfig = server;
-        _transport = new NioUdpTransport(_recvChannel, _sendBufferSize, _recvBufferSize);
-        _dtlsProtocol = new DTLSServerProtocol(secureRandom);
-
         if (_connectionPool == null) {
             _connectionPool = Executors.newFixedThreadPool(32, new AsyncScheduler.ScheduleFactory("In Connection"));
         }
 
-        if (_recvSegmentPool == null) {
-            _recvSegmentPool = Executors.newFixedThreadPool(32, new AsyncScheduler.ScheduleFactory("Receive-Segment"));
-        }
+        _sendBufferSize = (_profile.maxSegmentSize() - Segment.RUDP_HEADER_LEN) * _profile.maxRecvQueueSize();
+        _recvBufferSize = (_profile.maxSegmentSize() - Segment.RUDP_HEADER_LEN) * _profile.maxSendQueueSize();
+        _serverConfig = server;
+        _dtlsProtocol = new DTLSServerProtocol(secureRandom);
+        _scheduler = NioScheduler.getNioScheduler();
 
         _receiverThread = new ReceiverThread();
         _receiverThread.start();
@@ -131,52 +121,13 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         }
     }
 
-    private ClientHolder newConnection(SocketAddress endpoint) {
-        ClientHolder holder;
-        synchronized (_clientSockTable) {
-            holder = _clientSockTable.get(endpoint);
-            if (holder == null) {
-                holder = new ClientHolder(_recvChannel, _recvBufferSize, _sendBufferSize, endpoint);
-                _clientSockTable.put(endpoint, holder);
-            } else {
-                holder = new ClientHolder(_recvChannel, _recvBufferSize, _sendBufferSize, endpoint);
-                _clientSockTable.replace(endpoint, holder);
-            }
-        }
-        return holder;
-    }
-
-    private boolean hasClientSocket(SocketAddress endpoint) {
-        synchronized (_clientSockTable) {
-            return _clientSockTable.containsKey(endpoint);
-        }
-    }
-
-    private void processReceiver(byte[] buffer, int off, int len, SocketAddress endpoint) {
-        ClientHolder holder;
-        synchronized (_clientSockTable) {
-            holder = _clientSockTable.get(endpoint);
-        }
-
-        if (holder == null)
-            newConnection(endpoint);
-        try {
-            _bufferLocker.acquire();
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-        _recvBuffer = buffer.clone();
-        _recvBufferOffset = off;
-        _recvBufferLen = len;
-        holder.sendReceiveSignal();
-
-    }
-
     @Override
     public synchronized void close() {
         if (isClosed()) {
             return;
         }
+
+        _connectionPool.shutdown();
 
         _clientSockTable.forEach(new BiConsumer<SocketAddress, ClientHolder>() {
             @Override
@@ -201,39 +152,58 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
     }
 
     /**
-     * Registers a new client socket with the specified endpoint address.
+     * Registers a new client connection
+     *
+     * @param endpoint the new client.
+     * @return the clientHolder.
+     */
+    private ClientHolder newConnection(SocketAddress endpoint) {
+        ClientHolder holder;
+        synchronized (_clientSockTable) {
+            holder = _clientSockTable.get(endpoint);
+            if (holder == null) {
+                holder = new ClientHolder(_recvChannel, endpoint);
+                _clientSockTable.put(endpoint, holder);
+            } else {
+                holder = new ClientHolder(_recvChannel, endpoint);
+                _clientSockTable.replace(endpoint, holder);
+            }
+        }
+        return holder;
+    }
+
+    /**
+     * Registers a new client socket already connected using dtls
      *
      * @param endpoint the new socket.
      * @return the registered socket.
      */
-    private ReliableClientSocket addClientSocket(SocketAddress endpoint, ClientHolder holder) {
+    private SecureReliableClientSocket addClientSocket(SocketAddress endpoint, ClientHolder holder) {
         //Recebe um holder com o necessário para se criar um socket, verifica se já existe este endpoint criado no
         //sistema e retorna seu socket, se não existir, cria o socket, guarda o holder e retorna o socket.
         synchronized (_clientSockTable) {
             ClientHolder h = _clientSockTable.get(endpoint);
-            ReliableClientSocket sock = holder.getSocket();
+            SecureReliableClientSocket sock = h.getSocket();
             if (sock == null) {
                 try {
-                    sock = new ReliableClientSocket(_recvChannel, holder.getTransport(), holder.getSecureTransport(), endpoint, _profile);
+                    sock = new SecureReliableClientSocket(_recvChannel, holder.getSecureTransport(), endpoint, _profile);
                     sock.addStateListener(_stateListener);
-                    //sock.connect(endpoint);
                     holder.setSocket(sock);
                     _clientSockTable.replace(endpoint, holder);
                 } catch (IOException xcp) {
                     xcp.printStackTrace();
                 }
             }
-
             return sock;
         }
     }
 
-    /**
-     * Deregisters a client socket with the specified endpoint address.
-     *
-     * @param endpoint the socket.
-     * @return the deregistered socket.
-     */
+    private boolean hasClientSocket(SocketAddress endpoint) {
+        synchronized (_clientSockTable) {
+            return _clientSockTable.containsKey(endpoint);
+        }
+    }
+
     private ClientHolder removeClientSocket(SocketAddress endpoint) {
         synchronized (_uuidSockTable) {
             _uuidSockTable.values().remove(endpoint);
@@ -252,143 +222,54 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         }
     }
 
-    private class ReceiverThread extends Thread {
-
-        public ReceiverThread() {
-            super("Receiver Thread");
-        }
-
-        @Override
-        public void run() {
-            ByteBuffer buffer = ByteBuffer.allocate(65535);
-            SocketAddress clientEndpoint = null;
-            Segment segment = null;
-            while (!_closed) {
-                try {
-                    buffer.clear();
-                    clientEndpoint = _recvChannel.receive(buffer);
-                    if (clientEndpoint == null)
-                        continue;
-                    buffer.flip();
-                    segment = Segment.parse(buffer.array(), buffer.arrayOffset(), buffer.limit());
-                    if (segment instanceof SYNSegment) {
-                        _connectionPool.submit(new ConnectionTask(clientEndpoint));
-                    } else {
-                        processReceiver(buffer.array(), buffer.arrayOffset(), buffer.limit(), clientEndpoint);
-                    }
-
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
-        }
-    }
-
-    private class ConnectionTask implements Runnable {
-        private SocketAddress endpoint;
-        private ClientHolder holder;
-
-        public ConnectionTask(SocketAddress endpoint) {
-            this.endpoint = endpoint;
-            holder = newConnection(endpoint);
-        }
-
-        public void run() {
-            try {
-                holder.setSecureTransport(_dtlsProtocol.accept(_serverConfig, holder.transport));
-                holder.secureReceiverThread = new SecureReceiverThread(holder.getSecureTransport(), endpoint);
-                holder.secureReceiverThread.start();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    private class ReceiveTransport extends NioUdpTransport {
-        protected Semaphore lock;
-
-        public ReceiveTransport(DatagramChannel channel, int receiveLimit, int sendLimit, SocketAddress endpoint) throws InterruptedException {
-            super(channel, receiveLimit, sendLimit, endpoint);
-            lock = new Semaphore(1);
-            lock.acquire();
-        }
-
-        @Override
-        public int receive(byte[] buf, int off, int len, int waitMillis) throws IOException {
-            try {
-                lock.acquire();
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-            synchronized (_recvBuffer) {
-                int j = off;
-                for (int i = _recvBufferOffset; i < _recvBufferLen; i++) {
-                    buf[j] = _recvBuffer[i];
-                    j++;
-                }
-            }
-            _bufferLocker.release();
-            return len;
-        }
-
-        public void signal() {
-            lock.release();
-        }
-    }
-
     private class ClientHolder {
-        protected Thread secureReceiverThread;
+        protected Thread processSegment;
         private UUID uuid;
-        private ReceiveTransport transport;
-        private ReliableClientSocket socket;
+        private SecureReliableClientSocket socket;
         private DTLSTransport secureTransport;
+        private ClientTransporter transport;
+        private SocketAddress endpoint;
+        private BlockingQueue<byte[]> _rcvQueue;
 
-        public ClientHolder(DatagramChannel channel, int receiveLimit, int sendLimit, SocketAddress endpoint) {
-            try {
-                transport = new ReceiveTransport(channel, receiveLimit, sendLimit, endpoint);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
+        public ClientHolder(DatagramChannel channel, SocketAddress endpoint) {
+            _rcvQueue = new LinkedBlockingQueue<>();
+            this.endpoint = endpoint;
+            transport = new ClientTransporter(_rcvQueue, channel, endpoint);
         }
 
-        public void sendReceiveSignal() {
-            transport.signal();
-        }
-
-        public UUID getUuid() {
-            return uuid;
-        }
-
-        public void setUuid(UUID uuid) {
-            this.uuid = uuid;
-        }
-
-        public ReliableClientSocket getSocket() {
+        public SecureReliableClientSocket getSocket() {
             return socket;
         }
 
-        public void setSocket(ReliableClientSocket socket) {
+        public void setSocket(SecureReliableClientSocket socket) {
             this.socket = socket;
-        }
-
-        public ReceiveTransport getTransport() {
-            return transport;
-        }
-
-        public void setTransport(ReceiveTransport transport) {
-            this.transport = transport;
         }
 
         public DTLSTransport getSecureTransport() {
             return secureTransport;
         }
 
-        public void setSecureTransport(DTLSTransport secureTransport) {
+        public ClientTransporter getTransport() {
+            return transport;
+        }
+
+        public void secureHandshakCompleted(DTLSTransport secureTransport) {
             this.secureTransport = secureTransport;
+            this.processSegment = new ProcessSegmentThread(secureTransport, endpoint);
+            this.processSegment.start();
+        }
+
+        public void receiveRawData(byte[] buffer) {
+            try {
+                _rcvQueue.put(buffer);
+            } catch (InterruptedException e) {
+                LOGGER.warning("Client error on receive raw data");
+                e.printStackTrace();
+            }
         }
 
         public void close() {
-            secureReceiverThread.interrupt();
+            processSegment.interrupt();
             try {
                 secureTransport.close();
             } catch (Exception e) {
@@ -397,106 +278,223 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         }
     }
 
-    private class SecureReceiverThread extends Thread {
-        private DTLSTransport transport;
-        private byte[] buffer;
-        private SocketAddress endpoint;
+    private class ClientTransporter implements DatagramTransport {
 
-        public SecureReceiverThread(DTLSTransport transport, SocketAddress endpoint) {
-            super("Secure receiver thread " + endpoint);
-            this.transport = transport;
-            this.endpoint = endpoint;
-            buffer = new byte[_recvBufferSize];
+        private BlockingQueue<byte[]> _rcvQueue;
+        private DatagramChannel _channel;
+        private SocketAddress _endpoint;
+
+        public ClientTransporter(BlockingQueue<byte[]> _rcvQueue, DatagramChannel _channel, SocketAddress _endpoint) {
+            this._rcvQueue = _rcvQueue;
+            this._channel = _channel;
+            this._endpoint = _endpoint;
+        }
+
+        @Override
+        public int getReceiveLimit() throws IOException {
+            return _recvBufferSize;
+        }
+
+        @Override
+        public int getSendLimit() throws IOException {
+            return _sendBufferSize;
+        }
+
+        @Override
+        public int receive(byte[] bytes, int i, int i1, int i2) throws IOException {
+            byte[] buff;
+            try {
+                buff = _rcvQueue.take();
+                System.arraycopy(buff, 0, bytes, i, buff.length);
+                return buff.length;
+            } catch (InterruptedException e) {
+                LOGGER.warning("Sync client error on receive raw data");
+                e.printStackTrace();
+            }
+            return -1;
+        }
+
+        @Override
+        public void send(byte[] bytes, int i, int i1) throws IOException {
+            _scheduler.submit(_recvChannel, _endpoint, bytes, i, i1);
+        }
+
+        @Override
+        public void close() throws IOException {
+
+        }
+    }
+
+    private class BufferedPacket {
+        private byte[] buf;
+        private SocketAddress clientEndpoint;
+
+        public BufferedPacket(byte[] buffer, SocketAddress endpoint) {
+            this.buf = buffer;
+            this.clientEndpoint = endpoint;
+        }
+
+        public byte[] getBuffer() {
+            return buf;
+        }
+
+        public SocketAddress getClientEndpoint() {
+            return clientEndpoint;
+        }
+
+    }
+
+    private class ReceiverThread extends Thread {
+        public ReceiverThread() {
+            super("SecureReliableServerSocket");
+            setDaemon(true);
         }
 
         @Override
         public void run() {
-            Segment segment;
-            int len;
+            ByteBuffer buffer = ByteBuffer.allocate(65535);
+            Segment segment = null;
+            UUID uuid = null;
+            byte[] buf = null;
+            int tot = -1;
+
+            SocketAddress clientEndpoint = null;
+            BufferedPacket bufferedPacket = null;
+            ClientHolder holder;
+
             while (!_closed) {
                 try {
-                    len = transport.receive(buffer, 0, _recvBufferSize, 0);
-                    segment = Segment.parse(buffer, 0, len);
-                    _recvSegmentPool.submit(new ProcessSegmentTask(segment, endpoint, transport));
-                } catch (IOException e) {
-                    e.printStackTrace();
+                    buffer.clear();
+                    clientEndpoint = _recvChannel.receive(buffer);
+
+                    if (clientEndpoint == null) continue;
+
+                    tot = buffer.position();
+                    buf = new byte[tot];
+                    System.arraycopy(buffer.array(), 0, buf, 0, buf.length);
+
+                    segment = Segment.parse(buf);
+                    if (segment instanceof SYNSegment) {
+                        _connectionPool.submit(new SecureConnectionTask(clientEndpoint));
+                    } else {
+                        synchronized (_clientSockTable) {
+                            holder = _clientSockTable.get(clientEndpoint);
+                        }
+                        if (holder != null)
+                            holder.receiveRawData(buf);
+                        else
+                            LOGGER.warning("Unsynchronized client");
+                    }
+                } catch (Exception ex) {
+                    LOGGER.warning("Error on receiving and parsing PKG");
+                    ex.printStackTrace();
+                } finally {
+                    buffer.clear();
                 }
             }
         }
     }
 
-    private class ProcessSegmentTask implements Runnable {
-        private Segment segment;
-        private SocketAddress clientEndpoint;
-        private DTLSTransport secureTransport;
+    private class SecureConnectionTask implements Runnable {
+        private ClientHolder holder;
 
-        public ProcessSegmentTask(Segment segment, SocketAddress clientEndpoint, DTLSTransport secureTransport) {
-            this.segment = segment;
-            this.clientEndpoint = clientEndpoint;
-            this.secureTransport = secureTransport;
+        public SecureConnectionTask(SocketAddress endpoint) {
+            holder = newConnection(endpoint); //TODO verificar reconexão
         }
 
         @Override
         public void run() {
-            UUID uuid = null;
-            ReliableClientSocket sock = null;
-            SocketAddress oldEndpoint = null;
-
-            // handle UID segment?
-            if (segment instanceof UIDSegment) {
-                uuid = ((UIDSegment) segment).getUUID();
-                synchronized (_uuidSockTable) {
-                    if (_uuidSockTable.containsKey(uuid)) {
-                        oldEndpoint = _uuidSockTable.get(uuid);
-
-                        // Are the Endpoints the same or did the client change IP?
-                        if (oldEndpoint.equals(clientEndpoint) == false) {
-
-                            // client changed ip address
-                            LOGGER.fine("processing UIDSegment from different endpoint, updating");
-                            _uuidSockTable.remove(uuid);
-                            _uuidSockTable.put(uuid, clientEndpoint);
-
-                            synchronized (_clientSockTable) {
-                                ClientHolder clientHolder = _clientSockTable.get(oldEndpoint);
-                                ReliableClientSocket oldSock = clientHolder.getSocket();
-                                if (oldSock != null) { //TODO Test this
-                                    _clientSockTable.remove(oldEndpoint);
-                                    oldSock.setEndpoint(clientEndpoint);
-                                    _clientSockTable.put(clientEndpoint, clientHolder);
-                                }
-                            }
-                        } else {
-                            LOGGER.fine("ignored UIDSegment from same endpoint");
-                        }
-                    } else {
-                        _uuidSockTable.put(uuid, clientEndpoint);
-                    }
-                }
-            }
-
-            synchronized (_clientSockTable) {
-                if (segment instanceof SYNSegment) {
-                    ClientHolder holder = _clientSockTable.get(clientEndpoint);
-                    if (holder.getSocket() == null) {
-                        sock = addClientSocket(clientEndpoint, holder);
-                        holder.setSocket(sock);
-                    }
-                }
-                sock = _clientSockTable.get(clientEndpoint).getSocket();
-            }
-
-            if (sock != null) {
-                sock.segmentReceived(segment);
-            } else {
-                LOGGER.warning("drop " + segment);
+            try {
+                holder.secureHandshakCompleted(_dtlsProtocol.accept(_serverConfig, holder.getTransport()));
+            } catch (IOException e) {
+                LOGGER.severe("Handshake error");
+                e.printStackTrace();
             }
         }
     }
 
-    private class ReliableClientSocket extends SecureReliableSocket {
-        public ReliableClientSocket(DatagramChannel channel, NioUdpTransport transport, DTLSTransport secureTransport, SocketAddress endpoint, ReliableSocketProfile profile) throws IOException {
-            super(channel, transport, secureTransport, endpoint, profile);
+    private class ProcessSegmentThread extends Thread {
+        private Segment segment;
+        private SocketAddress clientEndpoint;
+        private SecureReliableClientSocket sock = null;
+        private DTLSTransport secureTransport;
+        private byte[] buffer = new byte[65535];
+
+        public ProcessSegmentThread(DTLSTransport secureTransport, SocketAddress endpoint) {
+            this.secureTransport = secureTransport;
+            this.clientEndpoint = endpoint;
+        }
+
+        @Override
+        public void run() {
+            while (true) {
+                try {
+                    int len = secureTransport.receive(buffer, 0, buffer.length, 0);
+                    this.segment = Segment.parse(buffer, 0, len);
+                } catch (IOException e) {
+                    LOGGER.warning("Stopping process segment thread.");
+                    e.printStackTrace();
+                }
+                UUID uuid = null;
+                SocketAddress oldEndpoint = null;
+
+                // handle UID segment?
+                if (segment instanceof UIDSegment) {
+                    uuid = ((UIDSegment) segment).getUUID();
+                    synchronized (_uuidSockTable) {
+                        if (_uuidSockTable.containsKey(uuid)) {
+                            oldEndpoint = _uuidSockTable.get(uuid);
+
+                            // Are the Endpoints the same or did the client change IP?
+                            if (oldEndpoint.equals(clientEndpoint) == false) {
+
+                                // client changed ip address
+                                LOGGER.fine("processing UIDSegment from different endpoint, updating");
+                                _uuidSockTable.remove(uuid);
+                                _uuidSockTable.put(uuid, clientEndpoint);
+
+                                synchronized (_clientSockTable) {
+                                    ClientHolder clientHolder = _clientSockTable.get(oldEndpoint);
+                                    SecureReliableClientSocket oldSock = clientHolder.getSocket();
+                                    if (oldSock != null) {
+                                        _clientSockTable.remove(oldEndpoint);
+                                        oldSock.setEndpoint(clientEndpoint);
+                                        _clientSockTable.put(clientEndpoint, clientHolder);
+                                    }
+                                }
+                            } else {
+                                LOGGER.fine("ignored UIDSegment from same endpoint");
+                            }
+                        } else {
+                            _uuidSockTable.put(uuid, clientEndpoint);
+                        }
+                    }
+                }
+
+                synchronized (_clientSockTable) {
+                    if (segment instanceof SYNSegment) {
+                        ClientHolder holder = _clientSockTable.get(clientEndpoint);
+                        if (holder.getSocket() == null) {
+                            sock = addClientSocket(clientEndpoint, holder);
+                            holder.setSocket(sock);
+                        }
+                    }
+                    //sock = _clientSockTable.get(clientEndpoint).getSocket();
+                }
+
+                if (sock != null) {
+                    sock.segmentReceived(segment);
+                } else {
+                    LOGGER.warning("drop " + segment);
+                }
+            }
+        }
+    }
+
+
+    private class SecureReliableClientSocket extends SecureReliableSocket {
+        public SecureReliableClientSocket(DatagramChannel channel, DTLSTransport secureTransport, SocketAddress endpoint, ReliableSocketProfile profile) throws IOException {
+            super(channel, secureTransport, endpoint, profile);
         }
 
         protected void segmentReceived(final Segment segment) {
@@ -540,7 +538,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         @Override
         public void connectionClosed(ReliableSocket sock) {
             // Remove client socket from the table of active connections.
-            if (sock instanceof ReliableClientSocket) {
+            if (sock instanceof SecureReliableClientSocket) {
                 removeClientSocket(sock.getRemoteSocketAddress());
             }
         }
@@ -548,7 +546,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         @Override
         public void connectionFailure(ReliableSocket sock) {
             // Remove client socket from the table of active connections.
-            if (sock instanceof ReliableClientSocket) {
+            if (sock instanceof SecureReliableClientSocket) {
                 removeClientSocket(sock.getRemoteSocketAddress());
             }
         }
