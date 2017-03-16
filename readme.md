@@ -11,4 +11,4 @@ SecureReliableServerSocket constructors.
 
 ## Dependencies
 
-It needs only [Bouncy Castle TLS API](https://www.bouncycastle.org/latest_releases.html) and [MR-UDP StreamingOptimization](https://bitbucket.org/endler/core-mrudp/branch/streamingOptimization) branch.
+It needs only [Bouncy Castle TLS API](https://www.bouncycastle.org/latest_releases.html) and MR-UDP module from the Bitbucket.

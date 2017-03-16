@@ -1,13 +1,14 @@
 package leopoldino.smrudp;
 
+import net.rudp.ReliableSocket;
 import net.rudp.impl.Segment;
 import org.bouncycastle.crypto.tls.DTLSTransport;
 
 import java.io.IOException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.nio.channels.DatagramChannel;
+import java.nio.channels.SelectionKey;
+import java.util.Iterator;
+import java.util.Set;
 
 /**
  * This is a improvised implementation of Input/output scheduler for SecureReliableSocket.
@@ -18,61 +19,112 @@ import java.util.concurrent.TimeUnit;
  */
 public class SecureScheduler extends net.rudp.AsyncScheduler {
 
-    private DTLSTransport _secureTransport;
-    private SecureReliableSocket _socket;
-    private byte[] _buffer;
-    private ExecutorService _recvThreadPool;
-    private Thread _rcvThread;
+    private static SecureScheduler _secureScheduler = new SecureScheduler();
 
-    public SecureScheduler() {
-        _buffer = new byte[65535];
-        _recvThreadPool = new ThreadPoolExecutor(16, 16, 0, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>(), new ScheduleFactory("Receive-Scheduler"));
-        _rcvThread = new Thread(this);
+    public static SecureScheduler getSecureScheduler() {
+        return _secureScheduler;
     }
 
-    public void start(DTLSTransport secureTransport, SecureReliableSocket socket) {
-        this._socket = socket;
-        this._secureTransport = secureTransport;
-        _rcvThread.start();
-    }
+    public SelectionKey register(DatagramChannel channel, ReliableSocket socket, DTLSTransport transport) {
+        SelectionKey key = null;
+        selectorLock.lock();
+        try {
+            channel.configureBlocking(false);
+            selector.wakeup();
+            key = channel.register(selector, SelectionKey.OP_READ);
+            key.attach(new Attacher(socket, transport));
+        } catch (Exception e) {
+            LOGGER.severe("COULD NOT REGISTER CHANNEL");
+        } finally {
+            selectorLock.unlock();
+        }
 
-    public void close() {
-        this._rcvThread.interrupt();
+        return key;
     }
 
     @Override
     public void run() {
         // Declaring variables here to reuse.
         Segment segment;
+        SelectionKey key;
+        Set<SelectionKey> selectedKeys;
+        Iterator<SelectionKey> keyIterator;
+        Attacher attacher;
         int length;
 
         // Scheduler Main Loop
         while (true) {
-            if (_secureTransport != null) {
-                try {
-                    length = _secureTransport.receive(_buffer, 0, _buffer.length, 0);
-                    segment = Segment.parse(_buffer, 0, length);
-                    _recvThreadPool.submit(new ReceiveTask(segment));
-                } catch (IOException e) {
-                    e.printStackTrace();
+            try {
+                selector.select();
+                selectedKeys = selector.selectedKeys();
+
+                selectorLock.lock();
+                selectorLock.unlock();
+
+                keyIterator = selectedKeys.iterator();
+
+                while (keyIterator.hasNext()) {
+                    key = keyIterator.next();
+
+                    attacher = (Attacher) key.attachment();
+                    length = attacher.getTransport().receive(recvBuffer.array(), 0, recvBuffer.capacity(), 0);
+
+                    recvBuffer.flip();
+                    try {
+                        segment = Segment.parse(recvBuffer.array(), 0, length);
+                        recvThreadPool.submit(new ReceiveTask(attacher.getSocket(), segment));
+                    } catch (Exception ex) {
+                        LOGGER.severe("Problem at parsing Segment received. Pkg received is corrupted.");
+                    } finally {
+                        recvBuffer.clear();
+                    }
+                    keyIterator.remove();
                 }
+            } catch (IOException e) {
+                e.printStackTrace();
             }
         }
     }
 
-    /**
-     * Routine class to dispatch the Selector's received packages.
-     */
-    protected class ReceiveTask implements Runnable {
-        private Segment segment;
+    public void submit(DTLSTransport secureTransport, Segment segment) {
+        try {
+            sendSemaphore.acquire();
+            secureTransport.send(segment.getBytes(), 0, segment.length());
+        } catch (Exception ex) {
+            LOGGER.severe("Error at submitting Segment");
+            ex.printStackTrace();
+        } finally {
+            sendSemaphore.release();
+        }
+    }
 
-        public ReceiveTask(Segment segment) {
-            this.segment = segment;
+    private class Attacher {
+        private ReliableSocket socket;
+        private DTLSTransport transport;
+
+        public Attacher(ReliableSocket socket) {
+            this.socket = socket;
         }
 
-        @Override
-        public void run() {
-            _socket.scheduleReceive(segment);
+        public Attacher(ReliableSocket socket, DTLSTransport transport) {
+            this.socket = socket;
+            this.transport = transport;
+        }
+
+        public ReliableSocket getSocket() {
+            return socket;
+        }
+
+        public void setSocket(ReliableSocket socket) {
+            this.socket = socket;
+        }
+
+        public DTLSTransport getTransport() {
+            return transport;
+        }
+
+        public void setTransport(DTLSTransport transport) {
+            this.transport = transport;
         }
     }
 }
