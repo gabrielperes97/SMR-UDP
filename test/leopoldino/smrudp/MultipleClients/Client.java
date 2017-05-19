@@ -26,14 +26,15 @@ public class Client {
 
         while (true) {
             String message = in.readLine();
-            if (message == null)
-                break;
-            System.out.println(message);
-            out.println(message);
-            out.flush();
+            if (message != null) {
+                /*break;*/
+                System.out.println(message);
+                out.println(message);
+                out.flush();
+            }
 
         }
 
-        reliableSocket.close();
+        //reliableSocket.close();
     }
 }

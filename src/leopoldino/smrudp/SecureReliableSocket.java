@@ -12,8 +12,8 @@ import java.net.SocketAddress;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
 import java.security.SecureRandom;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.logging.Logger;
 
 /**
@@ -131,7 +131,7 @@ public class SecureReliableSocket extends ReliableSocket {
         _secureScheduler = (SecureScheduler) _scheduler;
         _nioScheduler = NioScheduler.getNioScheduler();
         _nioKey = _nioScheduler.register(_channel, this);
-        _rcvQueue = new LinkedBlockingQueue<>();
+        _rcvQueue = new ArrayBlockingQueue<byte[]>(10 * 1024);
     }
 
     @Override
@@ -215,6 +215,8 @@ public class SecureReliableSocket extends ReliableSocket {
         @Override
         public int receive(byte[] bytes, int i, int i1, int i2) throws IOException {
             byte[] buff = new byte[0];
+            /*while (_rcvQueue.isEmpty()) //TODO Resolver essa gambiarra
+            {}*/
             try {
                 buff = _rcvQueue.take();
                 System.arraycopy(buff, 0, bytes, i, buff.length);

@@ -132,6 +132,10 @@ public class NioScheduler implements Runnable {
                 selector.select();
                 selectedKeys = selector.selectedKeys();
 
+                //Solve a deadlock caused by register
+                selectorLock.lock();
+                selectorLock.unlock();
+
                 keyIterator = selectedKeys.iterator();
 
                 while (keyIterator.hasNext()) {

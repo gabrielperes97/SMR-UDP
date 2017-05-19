@@ -31,12 +31,12 @@ public class ThreadedServer {
         BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
         while (true) {
             String msg = s.nextLine();
-            out.println(msg);
-            out.flush();
-            if (msg.length() == 0)
-                break;
-            System.out.println(in.readLine());
+            if (msg.length() != 0) {
+                out.println(msg);
+                out.flush();
+                System.out.println(in.readLine());
+            }
         }
-        client.close();
+        //client.close();
     }
 }
