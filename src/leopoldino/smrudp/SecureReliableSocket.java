@@ -1,124 +1,69 @@
 package leopoldino.smrudp;
 
-import leopoldino.smrudp.impl.NioUdpTransport;
 import net.rudp.ReliableSocket;
 import net.rudp.ReliableSocketProfile;
 import net.rudp.impl.SYNSegment;
 import net.rudp.impl.Segment;
-import org.bouncycastle.crypto.tls.*;
 
+import javax.net.ssl.SSLEngine;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
-import java.security.SecureRandom;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * This class implements a Secure Socket using a Reliable Socket. It's use the
- * Bouncy Castle DTLS implementation. To use, implement a TlsClient/TlsServer object, in the
- * tests we have an example about how to implement this.
- * <p>
- * We have two modes of use this, like a server or like a client. In a server mode the socket will behave like
- * a one-to-one server. In a client mode, the socket will behave like a classic client socket, connecting on
- * a server as configured.
- *
+ * Java Secure Socket Extension (JSSE). Working fine in non-blocking mode.
  * @author Gabriel Leopoldino
  */
 public class SecureReliableSocket extends ReliableSocket {
-    protected NioUdpTransport _transport;
-    protected DTLSTransport _secureTransport;
-    protected TlsClient _client;
-    protected SecureRandom _secureRandom;
-    protected SecureScheduler _secureScheduler;
 
-    public SecureReliableSocket(TlsClient client) throws IOException {
-        this(new ReliableSocketProfile(), client);
+    protected SecureScheduler secureScheduler;
+    protected ByteBuffer outAppData;
+    protected ByteBuffer outNetData;
+    protected ByteBuffer inAppData;
+    protected ByteBuffer inNetData;
+    protected ReceiveThread receiveThread;
+
+    protected SSLEngine sslEngine;
+
+    //Raw data received from UDP
+    protected ConcurrentLinkedQueue<ByteBuffer> receivedQueue;
+
+    public SecureReliableSocket() throws IOException {
+        this(new ReliableSocketProfile());
     }
 
-    public SecureReliableSocket(ReliableSocketProfile profile, TlsClient client) throws IOException {
-        this(DatagramChannel.open(), profile, client);
+    public SecureReliableSocket(ReliableSocketProfile profile) throws IOException {
+        this(DatagramChannel.open(), profile);
     }
 
-    public SecureReliableSocket(String host, int port, TlsClient client) throws IOException {
-        this(DatagramChannel.open(), new ReliableSocketProfile(), new InetSocketAddress(host, port), client);
+    public SecureReliableSocket(String host, int port) throws IOException {
+        this(DatagramChannel.open(), new InetSocketAddress(host, port), new ReliableSocketProfile());
     }
 
-    protected SecureReliableSocket(DatagramChannel channel, TlsClient client) {
-        this(channel, new ReliableSocketProfile(), client);
+    protected SecureReliableSocket(DatagramChannel channel) {
+        this(channel, new ReliableSocketProfile());
     }
 
-    protected SecureReliableSocket(DatagramChannel channel, ReliableSocketProfile profile, TlsClient client) {
+    protected SecureReliableSocket(DatagramChannel channel, ReliableSocketProfile profile) {
         super(channel, profile, SecureScheduler.getSecureScheduler());
-        initClient(client, new SecureRandom());
+        init();
     }
 
-    protected SecureReliableSocket(DatagramChannel channel, ReliableSocketProfile profile, SocketAddress endpoint, TlsClient client) throws IOException {
-        this(channel, profile, endpoint, client, new SecureRandom());
-    }
-
-    protected SecureReliableSocket(DatagramChannel channel, ReliableSocketProfile profile, SocketAddress endpoint, TlsClient client, SecureRandom secureRandom) throws IOException {
+    public SecureReliableSocket(DatagramChannel channel, SocketAddress endpoint, ReliableSocketProfile profile) throws IOException {
         super(channel, profile, SecureScheduler.getSecureScheduler());
-        initClient(client, secureRandom);
+        init();
         connect(endpoint);
     }
 
-    public SecureReliableSocket(TlsServer server) throws IOException {
-        this(new ReliableSocketProfile(), server);
-    }
-
-    public SecureReliableSocket(ReliableSocketProfile profile, TlsServer server) throws IOException {
-        this(DatagramChannel.open(), profile, server);
-    }
-
-    public SecureReliableSocket(int port, TlsServer server) throws IOException {
-        this(DatagramChannel.open(), new ReliableSocketProfile(), new InetSocketAddress(port), server);
-    }
-
-    protected SecureReliableSocket(DatagramChannel channel, TlsServer server) throws IOException {
-        this(channel, new ReliableSocketProfile(), server);
-    }
-
-    protected SecureReliableSocket(DatagramChannel channel, ReliableSocketProfile profile, TlsServer server) throws IOException {
-        super(channel, profile, null, SecureScheduler.getSecureScheduler());
-        initServer(server, new SecureRandom());
-    }
-
-    protected SecureReliableSocket(DatagramChannel channel, ReliableSocketProfile profile, SocketAddress bindAddress, TlsServer server) throws IOException {
-        this(channel, profile, bindAddress, server, new SecureRandom());
-    }
-
-    protected SecureReliableSocket(DatagramChannel channel, ReliableSocketProfile profile, SocketAddress bindAddress, TlsServer server, SecureRandom secureRandom) throws IOException {
-        super(channel, profile, bindAddress, SecureScheduler.getSecureScheduler());
-        initServer(server, secureRandom);
-    }
-
-    public SecureReliableSocket(DatagramChannel channel, NioUdpTransport transport, DTLSTransport secureTransport, SocketAddress endpoint, ReliableSocketProfile profile) {
-        super(channel, profile, SecureScheduler.getSecureScheduler());
-        this._transport = transport;
-        this._secureTransport = secureTransport;
-        _endpoint = endpoint;
-        init(null);
-    }
-
-    private void initClient(TlsClient client, SecureRandom secureRandom) {
-        _client = client;
-        init(secureRandom);
-    }
-
-    private void initServer(TlsServer server, SecureRandom secureRandom) throws IOException {
-        init(secureRandom);
-        _transport = new NioUdpTransport(_channel, getReceiveBufferSize(), getSendBufferSize());
-        DTLSServerProtocol serverProtocol = new DTLSServerProtocol(secureRandom);
-        _secureTransport = serverProtocol.accept(server, _transport);
-        _endpoint = _transport.getEndpoint();
-        super.connect(_endpoint, 0);
-    }
-
-    private void init(SecureRandom secureRandom) {
-        _secureRandom = secureRandom;
-        _secureScheduler = (SecureScheduler) _scheduler;
+    private void init() {
+        secureScheduler = (SecureScheduler) _scheduler;
+        this.receiveThread = new ReceiveThread();
+        this.receivedQueue = new ConcurrentLinkedQueue<>();
     }
 
     @Override
@@ -128,38 +73,71 @@ public class SecureReliableSocket extends ReliableSocket {
 
     @Override
     public void connect(SocketAddress endpoint, int timeout) throws IOException {
-        SYNSegment syn = new SYNSegment(100, _profile.maxOutstandingSegs(), _profile.maxSegmentSize(),
+        /*SYNSegment syn = new SYNSegment(100, _profile.maxOutstandingSegs(), _profile.maxSegmentSize(),
                 _profile.retransmissionTimeout(), _profile.cumulativeAckTimeout(), _profile.nullSegmentTimeout(), _profile.maxRetrans(),
                 _profile.maxCumulativeAcks(), _profile.maxOutOfSequence(), _profile.maxAutoReset());
-        _channel.send(ByteBuffer.wrap(syn.getBytes()), endpoint);
-        DTLSClientProtocol clientProtocol = new DTLSClientProtocol(_secureRandom);
+        this.submitSegment(syn);*/
+        /*DTLSClientProtocol clientProtocol = new DTLSClientProtocol(_secureRandom);
         _transport = new NioUdpTransport(_channel, getReceiveBufferSize(), getSendBufferSize(), endpoint);
-        _secureTransport = clientProtocol.connect(_client, _transport);
+        _secureTransport = clientProtocol.connect(_client, _transport);*/
+
+        this.receiveThread.start();
         super.connect(endpoint, timeout);
+    }
+
+    public void turnAServer()
+    {
+
     }
 
     @Override
     protected void closeSocket() {
-        try {
-            _secureTransport.close();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
         super.closeSocket();
     }
 
     @Override
     protected SelectionKey register() {
-        return _secureScheduler.register(_channel, this, _secureTransport);
+        return this.secureScheduler.register(this._channel, this);
     }
 
     @Override
     protected void submitSegment(Segment segment) {
-        _secureScheduler.submit(_secureTransport, segment);
+        this.secureScheduler.submit(this._channel, this._endpoint, ByteBuffer.wrap(segment.getBytes()));
     }
 
+
     protected void setEndpoint(SocketAddress endpoint) {
-        _transport.setEndpoint(endpoint);
         _endpoint = endpoint;
+    }
+
+    public SSLEngine getSslEngine() {
+        return sslEngine;
+    }
+
+    public int getNetBufferSize()
+    {
+        //return this.sslEngine.getSession().getPacketBufferSize();
+        return 65535;
+    }
+
+    protected void receiveRawData(ByteBuffer data)
+    {
+        receivedQueue.offer(data);
+    }
+
+    private class ReceiveThread extends Thread
+    {
+        @Override
+        public void run() {
+            while(true)
+            {
+                ByteBuffer data = receivedQueue.poll();
+                if (data != null)
+                {
+                    Segment segment = Segment.parse(data.array(), 0, data.position());
+                    SecureReliableSocket.this.scheduleReceive(segment);
+                }
+            }
+        }
     }
 }

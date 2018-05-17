@@ -21,21 +21,22 @@ public class ThreadedServer {
     public static final int PORT = 5510;
 
     public static void main(String[] args) throws IOException {
-        SecureReliableServerSocket server = new SecureReliableServerSocket(PORT, new DtlsServer());
+        SecureReliableServerSocket server = new SecureReliableServerSocket(PORT);
         SecureReliableSocket client = (SecureReliableSocket) server.accept();
 
         System.out.println("Conected to " + client.getRemoteSocketAddress());
 
-        Scanner s = new Scanner(System.in);
         PrintStream out = new PrintStream(client.getOutputStream());
         BufferedReader in = new BufferedReader(new InputStreamReader(client.getInputStream()));
+
         while (true) {
-            String msg = s.nextLine();
-            out.println(msg);
-            out.flush();
-            if (msg.length() == 0)
+            String message = in.readLine();
+            if (message == null)
                 break;
-            System.out.println(in.readLine());
+            System.out.println(message);
+            out.println(message);
+            out.flush();
+
         }
         client.close();
     }

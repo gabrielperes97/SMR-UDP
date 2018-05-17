@@ -1,130 +1,141 @@
 package leopoldino.smrudp;
 
+import net.rudp.AsyncScheduler;
 import net.rudp.ReliableSocket;
-import net.rudp.impl.Segment;
-import org.bouncycastle.crypto.tls.DTLSTransport;
 
 import java.io.IOException;
+import java.net.SocketAddress;
+import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
 import java.util.Iterator;
-import java.util.Set;
+import java.util.LinkedList;
+import java.util.List;
 
 /**
- * This is a improvised implementation of Input/output scheduler for SecureReliableSocket.
- * It works fine, but is not a perfect implementation, because of the limitations of DTLS
- * Bouncy Castle implementation (the lack of implementation with the NIO API).
+ * This is a very fu#####ing cool implementation of Input/output scheduler for SecureReliableSocket.
+ * It works fine, and it's much better than my lasts versions.
  *
  * @author Gabriel Leopoldino
  */
-public class SecureScheduler extends net.rudp.AsyncScheduler {
+public class SecureScheduler extends AsyncScheduler {
 
     private static SecureScheduler _secureScheduler = new SecureScheduler();
+
+    private List<ReliableSocket> registerRequests = new LinkedList<>();
 
     public static SecureScheduler getSecureScheduler() {
         return _secureScheduler;
     }
 
-    public SelectionKey register(DatagramChannel channel, ReliableSocket socket, DTLSTransport transport) {
+    public SelectionKey register(DatagramChannel channel, ReliableSocket socket) {
         SelectionKey key = null;
-        selectorLock.lock();
+        super.selectorLock.lock();
         try {
             channel.configureBlocking(false);
-            selector.wakeup();
-            key = channel.register(selector, SelectionKey.OP_READ);
-            key.attach(new Attacher(socket, transport));
+            super.selector.wakeup();
+            key = channel.register(super.selector, SelectionKey.OP_READ);
+            key.attach(socket);
         } catch (Exception e) {
             LOGGER.severe("COULD NOT REGISTER CHANNEL");
         } finally {
-            selectorLock.unlock();
+            super.selectorLock.unlock();
         }
-
+        System.out.println("Registred");
         return key;
     }
 
+    /**
+     * Receiving packets from DatagramChannel
+     * We receive the packet from the internet, give this to socket and it works with it
+     */
+    
     @Override
-    public void run() {
-        // Declaring variables here to reuse.
-        Segment segment;
-        SelectionKey key;
-        Set<SelectionKey> selectedKeys;
-        Iterator<SelectionKey> keyIterator;
-        Attacher attacher;
-        int length;
+    public void run()
+    {
+        while (true)
+        {
+            try
+            {
+                super.selector.select();
+                Iterator selectedKeys = super.selector.selectedKeys().iterator();
 
-        // Scheduler Main Loop
-        while (true) {
-            try {
-                selector.select();
-                selectedKeys = selector.selectedKeys();
+                super.selectorLock.lock();
+                super.selectorLock.unlock();
 
-                selectorLock.lock();
-                selectorLock.unlock();
 
-                keyIterator = selectedKeys.iterator();
+                while(selectedKeys.hasNext())
+                {
+                    SelectionKey key = (SelectionKey) selectedKeys.next();
+                    selectedKeys.remove();
 
-                while (keyIterator.hasNext()) {
-                    key = keyIterator.next();
+                    if (!key.isValid())
+                        continue;
 
-                    attacher = (Attacher) key.attachment();
-                    length = attacher.getTransport().receive(recvBuffer.array(), 0, recvBuffer.capacity(), 0);
+                    if (key.isReadable())
+                    {
+                        SecureReliableSocket client = (SecureReliableSocket) key.attachment();
 
-                    recvBuffer.flip();
-                    try {
-                        segment = Segment.parse(recvBuffer.array(), 0, length);
-                        recvThreadPool.submit(new ReceiveTask(attacher.getSocket(), segment));
-                    } catch (Exception ex) {
-                        LOGGER.severe("Problem at parsing Segment received. Pkg received is corrupted.");
-                    } finally {
-                        recvBuffer.clear();
+                        //I can't guarantee that the client can work with the package until it receive more packets
+                        //so I allocate temporary buffers here.
+                        //It's better than I copy the data two times.
+                        ByteBuffer inputData = ByteBuffer.allocate(client.getNetBufferSize());
+                        ((DatagramChannel) key.channel()).receive(inputData);
+                        //inputData.flip();
+                        super.recvThreadPool.submit(new ReceiveTask(client, inputData));
                     }
-                    keyIterator.remove();
                 }
             } catch (IOException e) {
+                LOGGER.warning("IO error on receive routine");
                 e.printStackTrace();
             }
         }
     }
 
-    public void submit(DTLSTransport secureTransport, Segment segment) {
+    /**
+     * Sending packets through DatagramChannel
+     *
+     * We don't need a lock for use send method because the Java Documentation says this.
+     *
+     * " This method may be invoked at any time. If another thread has already initiated a write operation upon this
+     *  channel, however, then an invocation of this method will block until the first operation is complete.
+     *  If this channel's socket is not bound then this method will first cause the socket to be bound to an address
+     *  that is assigned automatically, as if by invoking the bind method with a parameter of null. "
+     *
+     *  https://docs.oracle.com/javase/7/docs/api/java/nio/channels/DatagramChannel.html#send(java.nio.ByteBuffer,%20java.net.SocketAddress)
+     *
+     */
+    public void submit(DatagramChannel channel, SocketAddress endpoint, ByteBuffer outputData) {
         try {
-            sendSemaphore.acquire();
-            secureTransport.send(segment.getBytes(), 0, segment.length());
-        } catch (Exception ex) {
+            while (outputData.hasRemaining()) {
+                channel.send(outputData, endpoint);
+            }
+        }
+        catch (Exception ex) {
             LOGGER.severe("Error at submitting Segment");
             ex.printStackTrace();
-        } finally {
-            sendSemaphore.release();
         }
     }
 
-    private class Attacher {
-        private ReliableSocket socket;
-        private DTLSTransport transport;
+    /**
+     * This task exists because the ConcurrentLinkedQueue, used in receiveRawData, can block the Thread until the data is
+     * inserted in the list, and we don't want this on the receiving server thread.
+     */
+    class ReceiveTask implements Runnable
+    {
+        private SecureReliableSocket socket;
+        private ByteBuffer data;
 
-        public Attacher(ReliableSocket socket) {
+        public ReceiveTask(SecureReliableSocket socket, ByteBuffer data) {
             this.socket = socket;
+            this.data = data;
         }
 
-        public Attacher(ReliableSocket socket, DTLSTransport transport) {
-            this.socket = socket;
-            this.transport = transport;
-        }
-
-        public ReliableSocket getSocket() {
-            return socket;
-        }
-
-        public void setSocket(ReliableSocket socket) {
-            this.socket = socket;
-        }
-
-        public DTLSTransport getTransport() {
-            return transport;
-        }
-
-        public void setTransport(DTLSTransport transport) {
-            this.transport = transport;
+        @Override
+        public void run() {
+            this.socket.receiveRawData(this.data);
         }
     }
+
+
 }
