@@ -3,11 +3,14 @@ package leopoldino.smrudp.MultipleClients;
 import leopoldino.smrudp.DtlsServer;
 import leopoldino.smrudp.SecureReliableServerSocket;
 import leopoldino.smrudp.SecureReliableSocket;
+import leopoldino.smrudp.SecurityProfile;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.security.*;
+import java.security.cert.CertificateException;
 import java.util.Scanner;
 
 /**
@@ -20,8 +23,9 @@ public class ThreadedServer {
 
     public static final int PORT = 5510;
 
-    public static void main(String[] args) throws IOException {
-        SecureReliableServerSocket server = new SecureReliableServerSocket(PORT);
+    public static void main(String[] args) throws IOException, CertificateException, NoSuchAlgorithmException, KeyStoreException, UnrecoverableKeyException, KeyManagementException {
+        KeyStore ks = SecurityProfile.loadKeyStoreFromFile("foobar", "foobar");
+        SecureReliableServerSocket server = new SecureReliableServerSocket(PORT, SecurityProfile.getInstance(ks , "foobar"));
         SecureReliableSocket client = (SecureReliableSocket) server.accept();
 
         System.out.println("Conected to " + client.getRemoteSocketAddress());

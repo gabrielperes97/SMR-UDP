@@ -2,11 +2,14 @@ package leopoldino.smrudp.MultipleClients;
 
 import leopoldino.smrudp.DtlsClient;
 import leopoldino.smrudp.SecureReliableSocket;
+import leopoldino.smrudp.SecurityProfile;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.security.*;
+import java.security.cert.CertificateException;
 import java.util.Scanner;
 
 /**
@@ -18,8 +21,10 @@ import java.util.Scanner;
 
 public class Client {
 
-    public static void main(String args[]) throws IOException, InterruptedException {
-        SecureReliableSocket reliableSocket = new SecureReliableSocket("127.0.0.1", ThreadedServer.PORT);
+    public static void main(String args[]) throws IOException, InterruptedException, CertificateException, NoSuchAlgorithmException, KeyStoreException, UnrecoverableKeyException, KeyManagementException {
+
+        KeyStore ks = SecurityProfile.loadKeyStoreFromFile("foobar", "foobar");
+        SecureReliableSocket reliableSocket = new SecureReliableSocket("127.0.0.1", ThreadedServer.PORT, SecurityProfile.getInstance(ks , "foobar"));
         System.out.println("Connected to " + reliableSocket.getRemoteSocketAddress());
 
         Scanner s = new Scanner(System.in);

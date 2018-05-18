@@ -3,11 +3,13 @@ package leopoldino.smrudp.OneClient;
 import leopoldino.smrudp.DtlsServer;
 import leopoldino.smrudp.MultipleClients.ThreadedServer;
 import leopoldino.smrudp.SecureReliableSocket;
+import leopoldino.smrudp.SecurityProfile;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.net.InetSocketAddress;
+import java.security.KeyStore;
 import java.util.Scanner;
 
 /**
@@ -21,7 +23,8 @@ import java.util.Scanner;
 public class OneClientServer {
 
     public static void main(String[] args) throws Exception {
-        SecureReliableSocket socket = new SecureReliableSocket();
+        KeyStore ks = SecurityProfile.loadKeyStoreFromFile("foobar", "foobar");
+        SecureReliableSocket socket = new SecureReliableSocket(SecurityProfile.getInstance(ks , "foobar"));
         socket.bind(new InetSocketAddress(ThreadedServer.PORT));
         socket.turnAServer();
         System.out.println("Connected to " + socket.getRemoteSocketAddress());

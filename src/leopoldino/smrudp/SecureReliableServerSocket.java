@@ -11,8 +11,6 @@ import java.io.InterruptedIOException;
 import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
-import java.rmi.server.UID;
-import java.security.SecureRandom;
 import java.util.HashMap;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -30,8 +28,6 @@ import java.util.logging.Logger;
  * @author Gabriel Leopoldino
  */
 
-//TODO This class works, but need be revised
-//TODO Test change of endpoint of a client
 public class SecureReliableServerSocket extends ReliableServerSocket {
     /**
      * LOGGER
@@ -39,35 +35,28 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
     public static final Logger LOGGER = Logger.getLogger(SecureReliableServerSocket.class.getCanonicalName());
     static private ExecutorService _recvTaskPool;
     static private ExecutorService _connectionPool;
-    static private ExecutorService _recvSegmentPool;
     /* A table of active opened client sockets. */
     private final HashMap<SocketAddress, ReliableClientSocket> _clientSockTable;
     private ReceiverThread _receiverThread;
     private int _sendBufferSize;
     private int _recvBufferSize;
-    private byte[] _recvBuffer;
 
-    /**
-     * Specific Functions
-     */
-    private int _recvBufferOffset;
-    private int _recvBufferLen;
-    private Semaphore _bufferLocker = new Semaphore(1);
+    private SecurityProfile securityProfile;
 
 
-    public SecureReliableServerSocket(int port) throws IOException {
-        this(port, 0, null, new ReliableSocketProfile());
+    public SecureReliableServerSocket(int port, SecurityProfile securityProfile) throws IOException {
+        this(port, 0, null, new ReliableSocketProfile(), securityProfile);
     }
 
-    public SecureReliableServerSocket(int port, ReliableSocketProfile profile) throws IOException {
-        this(port, 0, null, profile);
+    public SecureReliableServerSocket(int port, ReliableSocketProfile profile, SecurityProfile securityProfile) throws IOException {
+        this(port, 0, null, profile, securityProfile);
     }
 
-    public SecureReliableServerSocket(int port, int backlog) throws IOException {
-        this(port, backlog, null, new ReliableSocketProfile());
+    public SecureReliableServerSocket(int port, int backlog, SecurityProfile securityProfile) throws IOException {
+        this(port, backlog, null, new ReliableSocketProfile(), securityProfile);
     }
 
-    public SecureReliableServerSocket(int port, int backlog, InetAddress bindAddr, ReliableSocketProfile profile) throws IOException {
+    public SecureReliableServerSocket(int port, int backlog, InetAddress bindAddr, ReliableSocketProfile profile, SecurityProfile securityProfile) throws IOException {
         super(new InetSocketAddress(bindAddr, port), backlog, profile, null, new TreeMap<UUID, SocketAddress>());
 
         _stateListener = new StateListener();
@@ -87,9 +76,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
             _connectionPool = Executors.newFixedThreadPool(32, new AsyncScheduler.ScheduleFactory("In Connection"));
         }
 
-        if (_recvSegmentPool == null) {
-            _recvSegmentPool = Executors.newFixedThreadPool(32, new AsyncScheduler.ScheduleFactory("Receive-Segment"));
-        }
+        this.securityProfile = securityProfile;
 
         _receiverThread = new ReceiverThread();
         _receiverThread.start();
@@ -306,9 +293,14 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
                          * Se o socket estiver em modo protegido e ocorrer um handover, a classe tentará enviar o ACK
                          * através do canal seguro, que pode não estar funcionando.
                          *
-                         * AS vezes tem como fazer um switch disso
+                         * As vezes tem como fazer um switch disso
                          *
+                         *
+                         * Hipotese 1
                          * Qualquer pacote SYN e UID ser tratado por fora do DTLS, às vezes até o ACK.
+                         * Simplesmente enviando estes pacotes por fora do DTLS.
+                         *
+                         *
                          */
                         holder.segmentReceived(segment);
                     }
@@ -335,38 +327,19 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
                     }
                 }
             }
+            _uuidSockTable.size();
         }
 
     }
 
-    /*private class ConnectionTask implements Runnable {
-        private SocketAddress endpoint;
-        private ClientHolder holder;
-
-        public ConnectionTask(SocketAddress endpoint) {
-            this.endpoint = endpoint;
-            holder = newConnection(endpoint);
-        }
-
-        public void run() {
-            try {
-                holder.setSecureTransport(_dtlsProtocol.accept(_serverConfig, holder.transport));
-                holder.secureReceiverThread = new SecureReceiverThread(holder.getSecureTransport(), endpoint);
-                holder.secureReceiverThread.start();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-    }*/
-
     private class ReliableClientSocket extends SecureReliableSocket {
         public ReliableClientSocket(DatagramChannel channel, SocketAddress endpoint, ReliableSocketProfile profile) throws IOException {
-            super(channel, profile);
+            super(channel, profile, SecureReliableServerSocket.this.securityProfile);
             this.setEndpoint(endpoint);
         }
 
         protected void segmentReceived(final Segment segment) {
-            scheduleReceive(segment);
+            this.scheduleReceive(segment);
         }
 
         @Override
