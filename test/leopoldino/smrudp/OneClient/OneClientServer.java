@@ -1,6 +1,5 @@
 package leopoldino.smrudp.OneClient;
 
-import leopoldino.smrudp.DtlsServer;
 import leopoldino.smrudp.MultipleClients.ThreadedServer;
 import leopoldino.smrudp.SecureReliableSocket;
 import leopoldino.smrudp.SecurityProfile;
@@ -24,21 +23,22 @@ public class OneClientServer {
 
     public static void main(String[] args) throws Exception {
         KeyStore ks = SecurityProfile.loadKeyStoreFromFile("foobar", "foobar");
-        SecureReliableSocket socket = new SecureReliableSocket(SecurityProfile.getInstance(ks , "foobar"));
-        socket.bind(new InetSocketAddress(ThreadedServer.PORT));
-        socket.turnAServer();
+        SecureReliableSocket socket = new SecureReliableSocket(ThreadedServer.PORT, SecurityProfile.getInstance(ks , "foobar"));
+
+        while (!socket.isConnected()) {}
         System.out.println("Connected to " + socket.getRemoteSocketAddress());
 
-        Scanner s = new Scanner(System.in);
         PrintStream out = new PrintStream(socket.getOutputStream());
         BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+
         while (true) {
-            String msg = s.nextLine();
-            out.println(msg);
-            out.flush();
-            if (msg.length() == 0)
+            String message = in.readLine();
+            if (message == null)
                 break;
-            System.out.println(in.readLine());
+            System.out.println(message);
+            out.println(message);
+            out.flush();
+
         }
         socket.close();
     }

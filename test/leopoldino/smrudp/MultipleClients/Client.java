@@ -1,6 +1,5 @@
 package leopoldino.smrudp.MultipleClients;
 
-import leopoldino.smrudp.DtlsClient;
 import leopoldino.smrudp.SecureReliableSocket;
 import leopoldino.smrudp.SecurityProfile;
 

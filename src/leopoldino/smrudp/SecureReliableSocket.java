@@ -1,22 +1,26 @@
 package leopoldino.smrudp;
 
 import net.rudp.ReliableSocket;
+import net.rudp.ReliableSocketListener;
 import net.rudp.ReliableSocketProfile;
-import net.rudp.impl.ACKSegment;
-import net.rudp.impl.SYNSegment;
-import net.rudp.impl.Segment;
-import net.rudp.impl.UIDSegment;
+import net.rudp.ReliableSocketStateListener;
+import net.rudp.impl.*;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLSession;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
+import java.util.Iterator;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -40,12 +44,22 @@ public class SecureReliableSocket extends ReliableSocket {
 
     protected SSLEngine sslEngine;
     protected SecurityProfile securityProfile;
+    protected List<SecureReliableSocketStateListener> secureStateListeners;
+    private boolean serverMode = false;
+    private boolean serverConnected = false;
+    protected Object serverLock = new Object();
 
     //Raw data received from UDP
-    protected ConcurrentLinkedQueue<ByteBuffer> receivedQueue;
+    protected LinkedBlockingQueue<ByteBuffer> receivedQueue;
 
     public SecureReliableSocket(SecurityProfile securityProfile) throws IOException {
         this(new ReliableSocketProfile(), securityProfile);
+    }
+
+    public SecureReliableSocket(int bindPort, SecurityProfile securityProfile) throws IOException {
+        super(DatagramChannel.open().bind(new InetSocketAddress(bindPort)), new ReliableSocketProfile(), SecureScheduler.getSecureScheduler());
+        init(securityProfile);
+        turnAServer();
     }
 
     public SecureReliableSocket(ReliableSocketProfile profile, SecurityProfile securityProfile) throws IOException {
@@ -62,6 +76,7 @@ public class SecureReliableSocket extends ReliableSocket {
 
     protected SecureReliableSocket(DatagramChannel channel, ReliableSocketProfile profile, SecurityProfile securityProfile) {
         super(channel, profile, SecureScheduler.getSecureScheduler());
+        //Scheduler null
         init(securityProfile);
     }
 
@@ -74,11 +89,20 @@ public class SecureReliableSocket extends ReliableSocket {
     private void init(SecurityProfile securityProfile) {
         secureScheduler = (SecureScheduler) _scheduler;
         this.receiveThread = new ReceiveThread();
-        this.receivedQueue = new ConcurrentLinkedQueue<>();
+        this.receivedQueue = new LinkedBlockingQueue<>();
+        this.secureStateListeners = new LinkedList<>();
+        super.addStateListener(new MrudpStateListener());
         this.securityProfile = securityProfile;
         this.sslEngine = this.securityProfile.getContext().createSSLEngine();
+        this.sslEngine.setUseClientMode(false);
         this.handshakeLock = new ReentrantLock();
         this.handshakeThread = new HandshakeHandler();
+
+        SSLSession sslSession = this.sslEngine.getSession();
+        inAppData = ByteBuffer.allocate(sslSession.getApplicationBufferSize());
+        outAppData = ByteBuffer.allocate(sslSession.getApplicationBufferSize());
+        inNetData = ByteBuffer.allocate(sslSession.getPacketBufferSize());
+        outNetData = ByteBuffer.allocate(sslSession.getPacketBufferSize());
     }
 
     @Override
@@ -98,14 +122,15 @@ public class SecureReliableSocket extends ReliableSocket {
 
         this.receiveThread.start();
         super.connect(endpoint, timeout);
-        this.sslEngine.beginHandshake();
-
+        //TODO botar pra esperar o handshake aqui
     }
 
     public void turnAServer()
     {
-
+        this.sslEngine.setUseClientMode(true);
+        _key = register();
     }
+
 
     @Override
     protected void closeSocket() {
@@ -117,28 +142,56 @@ public class SecureReliableSocket extends ReliableSocket {
         return this.secureScheduler.register(this._channel, this);
     }
 
+    public void addSecureStateListener(SecureReliableSocketStateListener stateListener) {
+        if (stateListener == null) { throw new NullPointerException("secureStateListener"); }
+
+        synchronized (this.secureStateListeners) {
+            if (!this.secureStateListeners.contains(stateListener)) {
+                this.secureStateListeners.add(stateListener);
+            }
+        }
+    }
+
+
+    public void removeSecureStateListener(SecureReliableSocketStateListener stateListener) {
+        if (stateListener == null) { throw new NullPointerException("secureStateListener"); }
+
+        synchronized (this.secureStateListeners) {
+            this.secureStateListeners.remove(stateListener);
+        }
+    }
+
     @Override
     protected void submitSegment(Segment segment) {
         /**
          * TODO Durante a fase inicial de conexão e durante handovers, o protocolo necessita enviar pacotes por fora do DTLS
          * Para isso é necessário que se tenha uma função para eles
          */
-        if (segment instanceof SYNSegment || segment instanceof ACKSegment || segment instanceof UIDSegment)
+        if (segment instanceof SYNSegment || segment instanceof ACKSegment || segment instanceof UIDSegment || segment instanceof NULSegment || segment instanceof FINSegment)
         {
             this.secureScheduler.submit(this._channel, this._endpoint, ByteBuffer.wrap(segment.getBytes()));
+            //System.out.println("Sending segment: "+segment.toString());
             return;
         }
 
         //Ve se tem handshake, se tiver, acorda a trhead que cuida disso,
         //senão envia logo
-        System.out.println("Sending segment: "+segment.toString());
+        System.out.println("Sending secure segment: "+segment.toString());
         SSLEngineResult.HandshakeStatus hs = sslEngine.getHandshakeStatus();
         if (hs != SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING && hs != SSLEngineResult.HandshakeStatus.FINISHED)
         {
             if (!handshakeThread.isAlive())
                 handshakeThread.start();
+            try {
+                synchronized (handshakeLock) {
+                    handshakeLock.wait();
+                }
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+
         }
-        handshakeLock.lock();
+        //handshakeLock.lock();
         outAppData.clear();
         outAppData.put(segment.getBytes());
         try {
@@ -176,13 +229,13 @@ public class SecureReliableSocket extends ReliableSocket {
         } catch (SSLException e) {
             e.printStackTrace();
         }
-        handshakeLock.unlock();
+        //handshakeLock.unlock();
     }
 
     @Override
     protected void scheduleReceive(Segment segment)
     {
-        System.out.println("Receiving segment: "+segment.toString());
+        //System.out.println("Receiving segment: "+segment.toString());
         super.scheduleReceive(segment);
     }
 
@@ -202,16 +255,19 @@ public class SecureReliableSocket extends ReliableSocket {
 
     protected void receiveRawData(ByteBuffer data)
     {
+        System.out.println("Secure data received");
         receivedQueue.offer(data);
     }
 
     //Verifica constantemente o status do handshake para algum tratamento
     private class HandshakeHandler extends Thread {
 
+        private boolean firstHandshake = true;
+
         @Override
         public void start()
         {
-            handshakeLock.lock();
+            //handshakeLock.lock();
             super.start();
         }
 
@@ -225,29 +281,15 @@ public class SecureReliableSocket extends ReliableSocket {
                     switch (hs) {
                         case NEED_UNWRAP:
                             data = receivedQueue.poll();
-
-                            SSLEngineResult res = sslEngine.unwrap(data, inAppData);
-                            inNetData.compact();
-                            hs = res.getHandshakeStatus();
-
-                            switch (res.getStatus()) {
-                                case CLOSED:
-                                    //UdpCommon.whenSSLClosed();
-                                    break;
-                                case BUFFER_OVERFLOW:
-                                    //UdpCommon.whenBufferOverflow(sslEngine, inAppData);
-                                    break;
-                                case BUFFER_UNDERFLOW:
-                                    //UdpCommon.whenBufferUnderflow(sslEngine, inNetData);
-                                    break;
-                                case OK:
-                                    break;
-                            }
-                            break;
+                            if (data == null)
+                                break;
+                            //data.flip();
+                            System.out.println("Receveu");
                         case NEED_UNWRAP_AGAIN:
-                            res = sslEngine.unwrap(data, inAppData);
-                            inNetData.compact();
-                            hs = res.getHandshakeStatus();
+                            inAppData.clear();
+                            SSLEngineResult res = sslEngine.unwrap(data, inAppData);
+                            data.compact();
+                            System.out.println("Fez o unwrap: "+res.getStatus());
 
                             switch (res.getStatus()) {
                                 case CLOSED:
@@ -264,10 +306,12 @@ public class SecureReliableSocket extends ReliableSocket {
                         case NEED_WRAP:
                             outNetData.clear();
                             res = sslEngine.wrap(outAppData, outNetData);
-                            hs = res.getHandshakeStatus();
+                            outNetData.flip();
+                            System.out.println("Fez o wrap");
                             switch (res.getStatus()) {
                                 case OK:
                                     SecureReliableSocket.this.secureScheduler.submit(SecureReliableSocket.this._channel, SecureReliableSocket.this._endpoint, outNetData);
+                                    System.out.println("Enviou");
                                     break;
                                 case CLOSED:
                                     //UdpCommon.whenSSLClosed();
@@ -278,7 +322,7 @@ public class SecureReliableSocket extends ReliableSocket {
                                     int appSize = sslEngine.getSession().getApplicationBufferSize();
                                     if (appSize > outAppData.capacity()) {
                                         ByteBuffer b = ByteBuffer.allocate(appSize);
-                                        outAppData.flip();
+                                        //outAppData.flip();
                                         b.put(outAppData);
                                         outAppData = b;
                                     }
@@ -288,7 +332,7 @@ public class SecureReliableSocket extends ReliableSocket {
                                     if (netSize > outNetData.capacity()) {
                                         //enlarge the peer network packet buffer
                                         ByteBuffer b = ByteBuffer.allocate(netSize);
-                                        outNetData.flip();
+                                        //outNetData.flip();
                                         b.put(outNetData);
                                         outNetData = b;
                                         //System.out.println("When Buffer Underflow");
@@ -305,18 +349,27 @@ public class SecureReliableSocket extends ReliableSocket {
                                 //new Thread(task).start();
                                 task.run();
                             }
-                            hs = sslEngine.getHandshakeStatus();
                             break;
                         default:
-                            hs = sslEngine.getHandshakeStatus();
                             break;
                     }
+                    hs = sslEngine.getHandshakeStatus();
                 }
+                if (firstHandshake)
+                {
+                    firstHandshake = false;
+                    Iterator it = SecureReliableSocket.this.secureStateListeners.iterator();
+                    while (it.hasNext()) {
+                        SecureReliableSocketStateListener l = (SecureReliableSocketStateListener) it.next();
+                        l.firstHandshakeConcluded(SecureReliableSocket.this);
+                    }
+                }
+                System.out.println("Handshake suceffully");
             } catch (SSLException e) {
                 e.printStackTrace();
-            }
-            finally {
-                handshakeLock.unlock();
+            } finally {
+                handshakeLock.notifyAll();
+                //handshakeLock.unlock();
             }
         }
     }
@@ -329,46 +382,77 @@ public class SecureReliableSocket extends ReliableSocket {
                 SSLEngineResult.HandshakeStatus hs = sslEngine.getHandshakeStatus();
                 //Se não está ocorrendo nenhum handshake, nem está em modo seguro ainda.
                 ByteBuffer data = receivedQueue.peek();
-                Segment segment = Segment.tryParse(data.array(), 0, data.position());
-                if (segment != null)
-                {
-                    SecureReliableSocket.this.scheduleReceive(segment);
-                    receivedQueue.poll();
-                    continue;
-                }
-                else if (hs == SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING || hs == SSLEngineResult.HandshakeStatus.FINISHED)
-                {
-                    try {
-                        SSLEngineResult res = sslEngine.unwrap(data, inAppData);
-                        switch (res.getStatus()) {
-                            case OK:
-                                segment = Segment.parse(data.array(), 0, data.position());
-                                SecureReliableSocket.this.scheduleReceive(segment);
-                                continue;
-                            case BUFFER_OVERFLOW:
-                                int appSize = sslEngine.getSession().getApplicationBufferSize();
-                                if (appSize > inAppData.capacity()) {
-                                    ByteBuffer b = ByteBuffer.allocate(appSize);
-                                    //inAppData.flip();
-                                    b.put(outAppData);
-                                    inAppData = b;
-                                }
-                                break;
-                        }
-                    } catch (SSLException e) {
-                        e.printStackTrace();
-                    }
-                    finally {
+                if (data != null) {
+                    Segment segment = Segment.tryParse(data.array(), 0, data.position());
+                    if (segment != null) {
+                        SecureReliableSocket.this.scheduleReceive(segment);
                         receivedQueue.poll();
+                        continue;
+                    } else if (hs == SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING || hs == SSLEngineResult.HandshakeStatus.FINISHED) {
+                        try {
+                            SSLEngineResult res = sslEngine.unwrap(data, inAppData);
+                            switch (res.getStatus()) {
+                                case OK:
+                                    segment = Segment.parse(data.array(), 0, data.position());
+                                    SecureReliableSocket.this.scheduleReceive(segment);
+                                    break;
+                                case BUFFER_OVERFLOW:
+                                    int appSize = sslEngine.getSession().getApplicationBufferSize();
+                                    if (appSize > inAppData.capacity()) {
+                                        ByteBuffer b = ByteBuffer.allocate(appSize);
+                                        //inAppData.flip();
+                                        b.put(outAppData);
+                                        inAppData = b;
+                                    }
+                                    break;
+                            }
+                        } catch (SSLException e) {
+                            e.printStackTrace();
+                        } finally {
+                            receivedQueue.poll();
+                        }
+                    } else {
+                        if (!handshakeThread.isAlive())
+                            handshakeThread.start();
                     }
-                }
-                else
-                {
-                    if (!handshakeThread.isAlive())
-                        handshakeThread.start();
                 }
 
             }
+        }
+    }
+
+    private class MrudpStateListener implements ReliableSocketStateListener
+    {
+
+        @Override
+        public void connectionOpened(ReliableSocket sock) {
+            try {
+                SecureReliableSocket.this.sslEngine.beginHandshake();
+                if (!handshakeThread.isAlive())
+                    handshakeThread.start();
+            } catch (SSLException e) {
+                e.printStackTrace();
+            }
+        }
+
+        @Override
+        public void connectionRefused(ReliableSocket sock) {
+
+        }
+
+        @Override
+        public void connectionClosed(ReliableSocket sock) {
+
+        }
+
+        @Override
+        public void connectionFailure(ReliableSocket sock) {
+
+        }
+
+        @Override
+        public void connectionReset(ReliableSocket sock) {
+
         }
     }
 }

@@ -2,6 +2,7 @@ package leopoldino.smrudp;
 
 import net.rudp.AsyncScheduler;
 import net.rudp.ReliableSocket;
+import net.rudp.impl.Segment;
 
 import java.io.IOException;
 import java.net.SocketAddress;
@@ -11,6 +12,7 @@ import java.nio.channels.SelectionKey;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.logging.Logger;
 
 /**
  * This is a very fu#####ing cool implementation of Input/output scheduler for SecureReliableSocket.
@@ -21,8 +23,6 @@ import java.util.List;
 public class SecureScheduler extends AsyncScheduler {
 
     private static SecureScheduler _secureScheduler = new SecureScheduler();
-
-    private List<ReliableSocket> registerRequests = new LinkedList<>();
 
     public static SecureScheduler getSecureScheduler() {
         return _secureScheduler;
@@ -80,9 +80,9 @@ public class SecureScheduler extends AsyncScheduler {
                         //so I allocate temporary buffers here.
                         //It's better than I copy the data two times.
                         ByteBuffer inputData = ByteBuffer.allocate(client.getNetBufferSize());
-                        ((DatagramChannel) key.channel()).receive(inputData);
+                        SocketAddress addr = ((DatagramChannel) key.channel()).receive(inputData);
                         //inputData.flip();
-                        super.recvThreadPool.submit(new ReceiveTask(client, inputData));
+                        super.recvThreadPool.submit(new ReceiveTask(client, inputData, addr));
                     }
                 }
             } catch (IOException e) {
@@ -125,15 +125,22 @@ public class SecureScheduler extends AsyncScheduler {
     {
         private SecureReliableSocket socket;
         private ByteBuffer data;
+        private SocketAddress addr;
 
-        public ReceiveTask(SecureReliableSocket socket, ByteBuffer data) {
+        public ReceiveTask(SecureReliableSocket socket, ByteBuffer data, SocketAddress addr) {
             this.socket = socket;
             this.data = data;
+            this.addr = addr;
         }
 
         @Override
         public void run() {
-            this.socket.receiveRawData(this.data);
+            Segment segment = Segment.tryParse(this.data.array(), 0, this.data.position());
+            if (segment == null)
+                //this.socket.receiveRawData(this.data);
+                LOGGER.warning("Cannot parse data");
+            else
+                this.socket.scheduleReceive(segment);
         }
     }
 

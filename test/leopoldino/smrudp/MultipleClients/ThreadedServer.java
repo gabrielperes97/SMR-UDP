@@ -1,6 +1,5 @@
 package leopoldino.smrudp.MultipleClients;
 
-import leopoldino.smrudp.DtlsServer;
 import leopoldino.smrudp.SecureReliableServerSocket;
 import leopoldino.smrudp.SecureReliableSocket;
 import leopoldino.smrudp.SecurityProfile;
@@ -11,7 +10,6 @@ import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.security.*;
 import java.security.cert.CertificateException;
-import java.util.Scanner;
 
 /**
  * This test is a server of an echo client. The client will be connected in the server and will reply with the same string.

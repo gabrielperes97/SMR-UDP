@@ -11,6 +11,7 @@ import java.io.InterruptedIOException;
 import java.net.*;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
+import java.nio.channels.SelectionKey;
 import java.util.HashMap;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -40,6 +41,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
     private ReceiverThread _receiverThread;
     private int _sendBufferSize;
     private int _recvBufferSize;
+    private SecureReliableSocketStateListener _secureStateListener;
 
     private SecurityProfile securityProfile;
 
@@ -60,6 +62,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         super(new InetSocketAddress(bindAddr, port), backlog, profile, null, new TreeMap<UUID, SocketAddress>());
 
         _stateListener = new StateListener();
+        _secureStateListener = new SecureStateListener();
         _clientSockTable = new HashMap<SocketAddress, ReliableClientSocket>();
 
         _timeout = 0;
@@ -158,6 +161,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
                 try {
                     sock = new ReliableClientSocket(_recvChannel, endpoint, _profile);
                     sock.addStateListener(_stateListener);
+                    sock.addSecureStateListener(_secureStateListener);
                     //sock.connect(endpoint);
                     _clientSockTable.put(endpoint, sock);
                 } catch (IOException xcp) {
@@ -314,7 +318,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
             {
                 synchronized (SecureReliableServerSocket.this._clientSockTable)
                 {
-                    if (!SecureReliableServerSocket.this._clientSockTable.containsKey(clientEndpoint)) {
+                    if (SecureReliableServerSocket.this._clientSockTable.containsKey(clientEndpoint)) {
                         holder = SecureReliableServerSocket.this._clientSockTable.get(clientEndpoint);
 
                         if (holder != null)
@@ -325,9 +329,10 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
                             LOGGER.warning("Secure data drop ");
                         }
                     }
+                    else
+                        LOGGER.warning("Drop data by not find the endpoint");
                 }
             }
-            _uuidSockTable.size();
         }
 
     }
@@ -335,6 +340,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
     private class ReliableClientSocket extends SecureReliableSocket {
         public ReliableClientSocket(DatagramChannel channel, SocketAddress endpoint, ReliableSocketProfile profile) throws IOException {
             super(channel, profile, SecureReliableServerSocket.this.securityProfile);
+            super.turnAServer();
             this.setEndpoint(endpoint);
         }
 
@@ -350,25 +356,16 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         @Override
         protected void closeSocket() {
         }
+
+        @Override
+        protected SelectionKey register() {
+            return null;
+        }
     }
 
     private class StateListener implements ReliableSocketStateListener {
         @Override
         public void connectionOpened(ReliableSocket sock) {
-            if (sock instanceof SecureReliableSocket) {
-                synchronized (_backlog) {
-                    while (_backlog.size() > DEFAULT_BACKLOG_SIZE) {
-                        try {
-                            _backlog.wait();
-                        } catch (InterruptedException xcp) {
-                            xcp.printStackTrace();
-                        }
-                    }
-
-                    _backlog.add(sock);
-                    _backlog.notify();
-                }
-            }
         }
 
         @Override
@@ -395,6 +392,26 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         @Override
         public void connectionReset(ReliableSocket sock) {
             // do nothing.
+        }
+    }
+
+    private class SecureStateListener implements SecureReliableSocketStateListener
+    {
+
+        @Override
+        public void firstHandshakeConcluded(SecureReliableSocket sock) {
+            synchronized (_backlog) {
+                while (_backlog.size() > DEFAULT_BACKLOG_SIZE) {
+                    try {
+                        _backlog.wait();
+                    } catch (InterruptedException xcp) {
+                        xcp.printStackTrace();
+                    }
+                }
+
+                _backlog.add(sock);
+                _backlog.notify();
+            }
         }
     }
 }
