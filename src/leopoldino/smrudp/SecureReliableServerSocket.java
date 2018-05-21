@@ -6,6 +6,7 @@ import net.rudp.impl.Segment;
 import net.rudp.impl.UIDSegment;
 
 
+import javax.net.ssl.SSLException;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.*;
@@ -316,22 +317,7 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
             //Se for um conteudo protegido
             else
             {
-                synchronized (SecureReliableServerSocket.this._clientSockTable)
-                {
-                    if (SecureReliableServerSocket.this._clientSockTable.containsKey(clientEndpoint)) {
-                        holder = SecureReliableServerSocket.this._clientSockTable.get(clientEndpoint);
-
-                        if (holder != null)
-                        {
-                            holder.receiveRawData(data);
-                        }
-                        else {
-                            LOGGER.warning("Secure data drop ");
-                        }
-                    }
-                    else
-                        LOGGER.warning("Drop data by not find the endpoint");
-                }
+                LOGGER.warning("Drop unparsed data");
             }
         }
 
@@ -357,6 +343,12 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
         protected void closeSocket() {
         }
 
+        protected void startHandshake()
+        {
+            if (!handshakeThread.isAlive())
+                handshakeThread.start();
+        }
+
         @Override
         protected SelectionKey register() {
             return null;
@@ -366,6 +358,13 @@ public class SecureReliableServerSocket extends ReliableServerSocket {
     private class StateListener implements ReliableSocketStateListener {
         @Override
         public void connectionOpened(ReliableSocket sock) {
+            try {
+                ((ReliableClientSocket) sock).getSslEngine().beginHandshake();
+                ((ReliableClientSocket) sock).startHandshake();
+            } catch (SSLException e) {
+                e.printStackTrace();
+            }
+            ((ReliableClientSocket) sock).startHandshake();
         }
 
         @Override
