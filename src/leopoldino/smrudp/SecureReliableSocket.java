@@ -179,6 +179,16 @@ public class SecureReliableSocket extends ReliableSocket {
         }
     }
 
+    protected synchronized int rawWrite(byte[] b, int off, int len) throws IOException
+    {
+        return super.write(b, off, len);
+    }
+
+    protected synchronized int rawRead(byte[] b, int off, int len) throws IOException
+    {
+        return super.read(b, off, len);
+    }
+
     @Override
     protected int read(byte[] b, int off, int len) throws IOException {
 
@@ -194,8 +204,8 @@ public class SecureReliableSocket extends ReliableSocket {
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
-            //TODO Trava até terminar o handshake
         }
+        int lenFinalArray = 0;
 
         //TODO transformar isso em locks de out
         synchronized (inNetData)
@@ -204,10 +214,11 @@ public class SecureReliableSocket extends ReliableSocket {
             int i = super.read(inNetData.array(), inNetData.arrayOffset(), inNetData.limit());
             if (i > 0) {
                 inNetData.position(inNetData.arrayOffset() + i);
+                inNetData.flip();
 
                 synchronized (inAppData) {
                     SSLEngineResult res = null;
-                    while (res == null || res.getStatus() != SSLEngineResult.Status.OK) {
+                    while (res == null || res.getStatus() != SSLEngineResult.Status.OK || inNetData.hasRemaining()) {
                         res = sslEngine.unwrap(inNetData, inAppData);
                         switch (res.getStatus()) {
                             case BUFFER_OVERFLOW:
@@ -225,15 +236,22 @@ public class SecureReliableSocket extends ReliableSocket {
                                 break;
                             case CLOSED:
                                 LOGGER.severe("Aí fudeu");
+                                break;
+                            case OK:
+                                lenFinalArray += res.bytesProduced();
+                                break;
                         }
                     }
-                    System.arraycopy(inAppData.array(), inAppData.arrayOffset(), b, off, inAppData.position());
-                    return inAppData.position() - inAppData.arrayOffset();
+                    System.arraycopy(inAppData.array(), inAppData.arrayOffset(), b, off, lenFinalArray);
                 }
             }
             else
                 return -1;
         }
+        if (lenFinalArray > 0)
+            return lenFinalArray;
+        else
+            return read(b, off, len);
     }
 
     @Override
@@ -272,22 +290,23 @@ public class SecureReliableSocket extends ReliableSocket {
                                 return super.write(outNetData.array(), outNetData.arrayOffset(), res.bytesProduced());
                             case BUFFER_OVERFLOW:
                                 int appSize = sslEngine.getSession().getApplicationBufferSize();
-                                if (appSize > outAppData.capacity()) {
+                                if (appSize > outAppData.capacity())
+                                {
                                     ByteBuffer buffer = ByteBuffer.allocate(appSize);
                                     outAppData.flip();
                                     buffer.put(outAppData);
                                     outAppData = buffer;
-                                    outAppData.flip();
                                 }
 
 
                                 int netSize = sslEngine.getSession().getPacketBufferSize();
-                                if (netSize > outNetData.capacity()) {
+                                if(netSize > outNetData.capacity())
+                                {
                                     //enlarge the peer network packet buffer
                                     ByteBuffer buffer = ByteBuffer.allocate(netSize);
-                                    //buffer.put(outNetData);
+                                    outNetData.flip();
+                                    buffer.put(outNetData);
                                     outNetData = buffer;
-                                    //outNetData.flip();
                                     //System.out.println("When Buffer Underflow");
                                 }
 
@@ -323,11 +342,9 @@ public class SecureReliableSocket extends ReliableSocket {
                 while (hs != SSLEngineResult.HandshakeStatus.FINISHED && hs != SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING) {
                     switch (hs) {
                         case NEED_UNWRAP:
-                            if (_inSeqRecvQueue.isEmpty())
-                                break;
-                            int readedBytes = SecureReliableSocket.super.read(inData, 0, 65535);
-                            if (readedBytes < 0)
-                                break;
+                            int readedBytes = 0;
+                            if (!_inSeqRecvQueue.isEmpty())
+                                readedBytes = rawRead(inData, 0, 65535);
                             inNetData.put(inData,0,readedBytes);
                             inNetData.flip();
                             /*inNetData.position(0);
@@ -339,7 +356,7 @@ public class SecureReliableSocket extends ReliableSocket {
 
                             switch (res.getStatus()) {
                                 case OK:
-                                    inNetData.clear();
+                                    //inNetData.clear();
                                     break;
                                 case CLOSED:
                                     //UdpCommon.whenSSLClosed();
@@ -364,7 +381,7 @@ public class SecureReliableSocket extends ReliableSocket {
                             switch (res.getStatus()) {
                                 case OK:
                                     outNetData.flip();
-                                    SecureReliableSocket.super.write(outNetData.array(), outNetData.arrayOffset(), outNetData.limit());
+                                    rawWrite(outNetData.array(), outNetData.arrayOffset(), outNetData.limit());
                                     break;
                                 case CLOSED:
                                     //UdpCommon.whenSSLClosed();
