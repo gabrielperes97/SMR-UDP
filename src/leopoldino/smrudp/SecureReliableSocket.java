@@ -47,7 +47,7 @@ public class SecureReliableSocket extends ReliableSocket {
     protected SSLEngine sslEngine;
     protected SecurityProfile securityProfile;
     protected List<SecureReliableSocketStateListener> secureStateListeners;
-    protected byte[] inData = new byte[65535];
+    protected byte[] inData;
 
 
     //Raw data received from UDP
@@ -99,6 +99,8 @@ public class SecureReliableSocket extends ReliableSocket {
         this.inputLock = new ReentrantLock();
         this.outputLock = new ReentrantLock();
 
+        this.inData = new byte[(_profile.maxSegmentSize() - Segment.RUDP_HEADER_LEN) * _profile.maxRecvQueueSize()];
+
         SSLSession sslSession = this.sslEngine.getSession();
         inAppData = ByteBuffer.allocate(sslSession.getApplicationBufferSize());
         outAppData = ByteBuffer.allocate(sslSession.getApplicationBufferSize());
@@ -140,8 +142,21 @@ public class SecureReliableSocket extends ReliableSocket {
     }
 
     @Override
-    protected void closeSocket() {
-        super.closeSocket();
+    public synchronized void close() throws IOException {
+        outputLock.lock();
+        inputLock.lock();
+
+        sslEngine.closeOutbound();
+        outAppData.clear();
+        while (!sslEngine.isOutboundDone())
+        {
+            outNetData.clear();
+            SSLEngineResult res = sslEngine.wrap(outAppData, outNetData);
+            outNetData.flip();
+            rawWrite(outNetData.array(), 0, outNetData.limit());
+
+        }
+        super.close();
     }
 
     public void addSecureStateListener(SecureReliableSocketStateListener stateListener) {
@@ -218,8 +233,8 @@ public class SecureReliableSocket extends ReliableSocket {
                         inNetData.flip();
                         break;
                     case CLOSED:
-                        LOGGER.severe("Aí fudeu");
-                        break;
+                        inputLock.unlock();
+                        return -1;
                     case OK:
                         lenFinalArray += res.bytesProduced();
                         break;
@@ -311,7 +326,6 @@ public class SecureReliableSocket extends ReliableSocket {
     private class HandshakeHandler extends Thread {
 
         private boolean firstHandshake = true;
-        private byte[]  inData = new byte[65535];
 
         @Override
         public void run() {
