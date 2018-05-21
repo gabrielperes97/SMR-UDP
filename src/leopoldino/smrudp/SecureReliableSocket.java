@@ -45,9 +45,7 @@ public class SecureReliableSocket extends ReliableSocket {
     protected SSLEngine sslEngine;
     protected SecurityProfile securityProfile;
     protected List<SecureReliableSocketStateListener> secureStateListeners;
-    private boolean serverMode = false;
-    private boolean serverConnected = false;
-    protected Object serverLock = new Object();
+    protected byte[] inData = new byte[65535];
 
 
     //Raw data received from UDP
@@ -210,11 +208,13 @@ public class SecureReliableSocket extends ReliableSocket {
         //TODO transformar isso em locks de out
         synchronized (inNetData)
         {
-            inNetData.clear();
-            int i = super.read(inNetData.array(), inNetData.arrayOffset(), inNetData.limit());
+            //inNetData.clear();
+            int i = super.read(inData, 0, inData.length);
             if (i > 0) {
-                inNetData.position(inNetData.arrayOffset() + i);
+                inNetData.clear();
+                inNetData.put(inData, 0, i);
                 inNetData.flip();
+                inAppData.clear();
 
                 synchronized (inAppData) {
                     SSLEngineResult res = null;
@@ -231,8 +231,10 @@ public class SecureReliableSocket extends ReliableSocket {
                                 }
                                 break;
                             case BUFFER_UNDERFLOW:
-                                i = super.read(inNetData.array(), inNetData.arrayOffset() + i, inNetData.limit());
-                                inNetData.position(inNetData.arrayOffset() + i);
+                                inNetData.compact();
+                                i = super.read(inNetData.array(), 0, inData.length);
+                                inNetData.put(inData, 0, i);
+                                inNetData.flip();
                                 break;
                             case CLOSED:
                                 LOGGER.severe("Aí fudeu");
@@ -268,7 +270,6 @@ public class SecureReliableSocket extends ReliableSocket {
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
-            //TODO Trava até terminar o handshake
         }
 
         synchronized (outAppData)
